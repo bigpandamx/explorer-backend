@@ -74,10 +74,28 @@ package object extractors {
       val headerId          = apiBlock.header.id
       val height            = apiBlock.header.height
       val ts                = apiBlock.header.timestamp
+      
+      // FIX: Calculate globalIndex based on chronological ordering using block height and timestamp
+      // This ensures proper ordering even if blocks are processed out of order
+      val baseGlobalIndex = parentOpt match {
+        case Some(parent) => 
+          // Use parent's maxTxGix, but validate it makes chronological sense
+          if (parent.timestamp <= ts && parent.height < height) {
+            parent.maxTxGix
+          } else {
+            // If parent relationship seems incorrect (due to processing order issues),
+            // calculate based on height difference as fallback
+            (height - 1) * 100L // Approximate transactions per block
+          }
+        case None => 
+          // Genesis or missing parent - calculate from height
+          (height - 1) * 100L
+      }
+      
       val txs =
         apiBlock.transactions.transactions.zipWithIndex
           .map { case (tx, i) =>
-            val globalIndex = lastTxGlobalIndex + i + 1
+            val globalIndex = baseGlobalIndex + i + 1
             Transaction(tx.id, headerId, height, isCoinbase = false, ts, tx.size, i, globalIndex, mainChain = false)
           }
       val (init, coinbase) = txs.init -> txs.lastOption

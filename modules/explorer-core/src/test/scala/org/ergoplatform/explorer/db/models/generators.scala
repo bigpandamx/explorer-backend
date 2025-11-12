@@ -463,4 +463,159 @@ object generators {
       tokenName <- Gen.oneOf("BLOCKED#1", "BLOCKED#2", "BLOCKED#3")
     } yield BlockedToken(id, tokenName)
 
+    /** Generator for testing timestamp and globalIndex ordering consistency
+    * This addresses the issue #259 where ordering by timestamp != ordering by globalIndex
+    */
+  def timestampOrderingTestGen: Gen[(List[Header], List[Transaction])] =
+    for {
+      numBlocks <- Gen.choose(3, 8)
+      headers   <- Gen.listOfN(numBlocks, headerGen.map(_.copy(mainChain = true)))
+      txsPerBlock = 2
+      baseTimestamp = 1640995200000L // Jan 1, 2022 00:00:00 UTC
+      baseGlobalIndex = 1L
+      timestampJitter <- Gen.listOfN(numBlocks * txsPerBlock, Gen.choose(-5000L, 5000L))
+      transactions <- Gen.listOfN(numBlocks * txsPerBlock, transactionGen(mainChain = true))
+    } yield {
+      val txs = headers.zipWithIndex.flatMap { case (header, blockIndex) =>
+        (0 until txsPerBlock).map { txIndex =>
+          val txListIndex = blockIndex * txsPerBlock + txIndex
+          val globalIndex = baseGlobalIndex + txListIndex
+          // Simulate potential timestamp inconsistency
+          val timestamp = baseTimestamp + (globalIndex * 1000L) + timestampJitter(txListIndex)
+          
+          transactions(txListIndex).copy(
+            headerId = header.id,
+            inclusionHeight = header.height,
+            globalIndex = globalIndex,
+            timestamp = timestamp,
+            index = txIndex
+          )
+        }
+      }
+      (headers, txs)
+    }
+
+  /** Generator for testing cross-year timestamp consistency (addresses issue #259)
+    * Creates transactions from 2023 and 2024 to test the reported issue
+    */
+  def crossYearTimestampTestGen: Gen[(List[Header], List[Transaction], List[Transaction])] =
+    for {
+      // Create headers for 2023 and 2024 blocks
+      headers2023 <- Gen.listOfN(3, headerGen.map(h => h.copy(mainChain = true, height = h.height % 1000 + 100000)))
+      headers2024 <- Gen.listOfN(3, headerGen.map(h => h.copy(mainChain = true, height = h.height % 1000 + 101000)))
+      
+      // Timestamps for 2023 (between Jan 1, 2023 and Dec 31, 2023)
+      timestamp2023Base = 1672531200000L // Jan 1, 2023 00:00:00 UTC
+      timestamp2023End = 1704067199000L  // Dec 31, 2023 23:59:59 UTC
+      
+      // Timestamps for 2024 (between Jan 1, 2024 and Dec 31, 2024)
+      timestamp2024Base = 1704067200000L // Jan 1, 2024 00:00:00 UTC
+      timestamp2024End = 1735689599000L  // Dec 31, 2024 23:59:59 UTC
+      
+      // Generate timestamps and transactions
+      timestamps2023 <- Gen.listOfN(6, Gen.choose(timestamp2023Base, timestamp2023End))
+      timestamps2024 <- Gen.listOfN(6, Gen.choose(timestamp2024Base, timestamp2024End))
+      transactions2023 <- Gen.listOfN(6, transactionGen(mainChain = true))
+      transactions2024 <- Gen.listOfN(6, transactionGen(mainChain = true))
+    } yield {
+      val globalIndexStart2023 = 1000L
+      val globalIndexStart2024 = 2000L
+      
+      val txs2023 = headers2023.zipWithIndex.flatMap { case (header, blockIndex) =>
+        (0 until 2).map { txIndex =>
+          val txListIndex = blockIndex * 2 + txIndex
+          val globalIndex = globalIndexStart2023 + txListIndex
+          
+          transactions2023(txListIndex).copy(
+            headerId = header.id,
+            inclusionHeight = header.height,
+            globalIndex = globalIndex,
+            timestamp = timestamps2023(txListIndex),
+            index = txIndex
+          )
+        }
+      }
+      
+      val txs2024 = headers2024.zipWithIndex.flatMap { case (header, blockIndex) =>
+        (0 until 2).map { txIndex =>
+          val txListIndex = blockIndex * 2 + txIndex
+          val globalIndex = globalIndexStart2024 + txListIndex
+          
+          transactions2024(txListIndex).copy(
+            headerId = header.id,
+            inclusionHeight = header.height,
+            globalIndex = globalIndex,
+            timestamp = timestamps2024(txListIndex),
+            index = txIndex
+          )
+        }
+      }
+      
+      (headers2023 ++ headers2024, txs2023, txs2024)
+    }
+
+  /** Generator for simulating chain reorganization scenarios
+    * Creates main chain and fork chain data to test globalIndex consistency
+    */
+  def chainReorgSimulationGen: Gen[(List[Header], List[Header], List[Transaction], List[Transaction])] =
+    for {
+      // Main chain headers (will be marked as non-main during reorg)
+      mainHeaders <- Gen.listOfN(4, headerGen.map(_.copy(mainChain = true)))
+      
+      // Fork chain headers (will become main during reorg) 
+      forkHeaders <- Gen.listOfN(3, headerGen.map(_.copy(mainChain = false)))
+      
+      // Generate transactions for both chains
+      mainTransactions <- Gen.listOfN(4, transactionGen(mainChain = true))
+      forkTransactions <- Gen.listOfN(3, transactionGen(mainChain = false))
+      
+      baseGlobalIndex = 1L
+      baseTimestamp = System.currentTimeMillis() - 86400000L // 24 hours ago
+    } yield {
+      val mainTxs = mainHeaders.zipWithIndex.map { case (header, blockIndex) =>
+        mainTransactions(blockIndex).copy(
+          headerId = header.id,
+          inclusionHeight = header.height,
+          globalIndex = baseGlobalIndex + blockIndex,
+          timestamp = baseTimestamp + (blockIndex * 60000L), // 1 minute apart
+          index = 0
+        )
+      }
+      
+      val forkTxs = forkHeaders.zipWithIndex.map { case (header, blockIndex) =>
+        forkTransactions(blockIndex).copy(
+          headerId = header.id,
+          inclusionHeight = header.height,
+          globalIndex = baseGlobalIndex + 100 + blockIndex, // Different range to avoid conflicts
+          timestamp = baseTimestamp + (blockIndex * 60000L) + 30000L, // 30 seconds offset
+          index = 0
+        )
+      }
+      
+      (mainHeaders, forkHeaders, mainTxs, forkTxs)
+    }
+
+  /** Generator for transaction ordering validation tests
+    * Creates transactions with specific timestamp/globalIndex patterns to test ordering queries
+    */
+  def transactionOrderingValidationGen: Gen[(List[Header], List[Transaction])] =
+    for {
+      numBlocks <- Gen.choose(5, 10)
+      headers   <- Gen.listOfN(numBlocks, headerGen.map(_.copy(mainChain = true)))
+      transactions <- Gen.listOfN(numBlocks, transactionGen(mainChain = true))
+      baseTimestamp = System.currentTimeMillis() - 3600000L // 1 hour ago
+    } yield {
+      val txs = headers.zipWithIndex.map { case (header, blockIndex) =>
+        transactions(blockIndex).copy(
+          headerId = header.id,
+          inclusionHeight = header.height,
+          globalIndex = (blockIndex + 1).toLong,
+          timestamp = baseTimestamp + (blockIndex * 120000L), // 2 minutes apart
+          index = 0,
+          isCoinbase = blockIndex == 0 // First tx is coinbase
+        )
+      }
+      (headers, txs)
+    }
+
 }
